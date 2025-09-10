@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,34 +20,35 @@ type watcher struct {
 	cancel context.CancelFunc
 }
 
-// getStackTrace 获取当前调用堆栈
-func getStackTrace(skip int) string {
-	buf := make([]byte, 4096)
+// getAllGoroutineStack 获取所有 goroutine 的完整堆栈
+func getAllGoroutineStack() string {
+	buf := make([]byte, 1024*1024) // 1MB 缓冲区
 	for {
-		n := runtime.Stack(buf, false)
+		n := runtime.Stack(buf, true) // true 表示获取所有 goroutine
 		if n < len(buf) {
-			return formatStack(buf[:n], skip)
+			return string(buf[:n])
 		}
+		// 如果缓冲区不够，加倍大小重试
 		buf = make([]byte, 2*len(buf))
 	}
 }
 
-// formatStack 格式化堆栈输出，跳过指定层数
-func formatStack(buf []byte, skip int) string {
-	stack := string(buf)
-	lines := strings.Split(stack, "\n")
+// getCurrentGoroutineID 获取当前 goroutine ID
+func getCurrentGoroutineID() uint64 {
+	b := make([]byte, 64)
+	b = b[:runtime.Stack(b, false)]
+	s := strings.TrimPrefix(string(b), "goroutine ")
+	s = s[:strings.Index(s, " ")]
+	id, _ := strconv.ParseUint(s, 10, 64)
+	return id
+}
 
-	// 跳过 runtime 调用
-	var filtered []string
-	count := 0
-	for i := 0; i < len(lines); i += 2 {
-		if count >= skip && i+1 < len(lines) {
-			filtered = append(filtered, lines[i], lines[i+1])
-		}
-		count++
-	}
-
-	return strings.Join(filtered, "\n")
+// formatStack 优化堆栈输出格式
+func formatStack(stack string) string {
+	// 添加分隔线使输出更易读
+	return "======================= FULL STACK TRACE =======================\n" +
+		stack +
+		"\n==========================================================="
 }
 
 func (w *watcher) Next() (services []*registry.ServiceInstance, err error) {
@@ -69,10 +71,38 @@ func (w *watcher) Next() (services []*registry.ServiceInstance, err error) {
 }
 
 func (w *watcher) Stop() error {
-	// 在停止时打印堆栈跟踪
-	stack := getStackTrace(2) // 跳过2层调用
-	fmt.Printf("[%s] Watcher stopped\nStack trace:\n%s\n",
-		time.Now().Format(time.RFC3339), stack)
+	now := time.Now().Format(time.RFC3339)
+	gid := getCurrentGoroutineID()
+
+	// 获取所有 goroutine 的完整堆栈
+	fullStack := getAllGoroutineStack()
+
+	// 获取当前调用链（跳过3层）
+	pc := make([]uintptr, 20)
+	n := runtime.Callers(3, pc)
+	callerTrace := ""
+	if n > 0 {
+		frames := runtime.CallersFrames(pc[:n])
+		var trace strings.Builder
+		for {
+			frame, more := frames.Next()
+			trace.WriteString(fmt.Sprintf("%s\n\t%s:%d\n",
+				frame.Function, frame.File, frame.Line))
+			if !more {
+				break
+			}
+		}
+		callerTrace = trace.String()
+	}
+
+	// 打印所有信息
+	fmt.Printf(`
+[%s] [Goroutine-%d] Watcher stopped
+--- Current Caller Trace ---
+%s
+--- All Goroutines Stack Trace ---
+%s
+`, now, gid, callerTrace, formatStack(fullStack))
 
 	if w.cancel != nil {
 		w.cancel()
