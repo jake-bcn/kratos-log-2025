@@ -252,18 +252,18 @@ func (r *Registry) resolve(ctx context.Context, ss *serviceSet) error {
 	go func() {
 		defer func() {
 			if r := recover(); r != nil {
-				fmt.Println("Recovered: ", ss.serviceName, r)
+				fmt.Println("[%s] Recovered: ", time.Now().Format(time.RFC3339), ss.serviceName, r)
 			}
-			fmt.Println("Consul registry watcher closed  222: ", ss.serviceName)
+			fmt.Println("[%s] Consul registry watcher closed  222: ", time.Now().Format(time.RFC3339), ss.serviceName)
 		}()
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				fmt.Println("ticker start: ", ss.serviceName, idx)
+				fmt.Println("[%s] ticker start: ", time.Now().Format(time.RFC3339), ss.serviceName, idx)
 				tmpService, tmpIdx, err := listServices(ss.ctx, ss.serviceName, idx, true)
-				fmt.Println("ticker end: ", ss.serviceName, idx)
+				fmt.Println("[%s] ticker end: ", time.Now().Format(time.RFC3339), ss.serviceName, idx)
 				if err != nil {
 					if err := sleepCtx(ss.ctx, time.Second); err != nil {
 						return
@@ -276,7 +276,7 @@ func (r *Registry) resolve(ctx context.Context, ss *serviceSet) error {
 				}
 				idx = tmpIdx
 			case <-ss.ctx.Done():
-				fmt.Println("Consul registry watcher closed: ", ss.serviceName)
+				fmt.Println("[%s] Consul registry watcher closed: ", time.Now().Format(time.RFC3339), ss.serviceName)
 				return
 			}
 		}
