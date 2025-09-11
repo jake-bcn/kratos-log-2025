@@ -20,17 +20,43 @@ type watcher struct {
 	cancel context.CancelFunc
 }
 
-// getAllGoroutineStack 获取所有 goroutine 的完整堆栈
-func getAllGoroutineStack() string {
+// getRelevantGoroutineStacks 获取当前 goroutine 及相关 goroutine 的堆栈
+func getRelevantGoroutineStacks() string {
+	currentGID := getCurrentGoroutineID()
+
+	// 获取所有 goroutine 的堆栈
 	buf := make([]byte, 1024*1024) // 1MB 缓冲区
-	for {
-		n := runtime.Stack(buf, true) // true 表示获取所有 goroutine
-		if n < len(buf) {
-			return string(buf[:n])
+	n := runtime.Stack(buf, true)
+	allStacks := string(buf[:n])
+
+	// 筛选相关 goroutine
+	var relevantStacks strings.Builder
+	stacks := strings.Split(allStacks, "\n\n")
+
+	for _, stack := range stacks {
+		if stack == "" {
+			continue
 		}
-		// 如果缓冲区不够，加倍大小重试
-		buf = make([]byte, 2*len(buf))
+
+		// 总是包含当前 goroutine
+		if strings.Contains(stack, fmt.Sprintf("goroutine %d ", currentGID)) {
+			relevantStacks.WriteString(stack)
+			relevantStacks.WriteString("\n\n")
+			continue
+		}
+
+		// 包含与当前 goroutine 相关的其他 goroutine
+		if isRelatedToCurrent(stack, currentGID) {
+			relevantStacks.WriteString(stack)
+			relevantStacks.WriteString("\n\n")
+		}
 	}
+
+	if relevantStacks.Len() == 0 {
+		return "No relevant goroutines found"
+	}
+
+	return relevantStacks.String()
 }
 
 // getCurrentGoroutineID 获取当前 goroutine ID
@@ -43,10 +69,47 @@ func getCurrentGoroutineID() uint64 {
 	return id
 }
 
+// isRelatedToCurrent 判断 goroutine 是否与当前 goroutine 相关
+func isRelatedToCurrent(stack string, currentGID uint64) bool {
+	// 规则1：检查是否由当前 goroutine 创建
+	if strings.Contains(stack, "created by") {
+		if strings.Contains(stack, fmt.Sprintf("in goroutine %d", currentGID)) {
+			return true
+		}
+	}
+
+	// 规则2：检查是否在等待相同的资源（通道、互斥锁等）
+	if strings.Contains(stack, "chan receive") ||
+		strings.Contains(stack, "chan send") ||
+		strings.Contains(stack, "select") ||
+		strings.Contains(stack, "sync.Mutex") {
+		return true
+	}
+
+	// 规则3：检查是否有共同的调用路径（Kratos 相关）
+	commonPrefixes := []string{
+		"github.com/go-kratos/kratos",
+		"contrib/registry/consul",
+		"transport/grpc",
+		"registry.",
+	}
+
+	for _, prefix := range commonPrefixes {
+		if strings.Contains(stack, prefix) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // formatStack 优化堆栈输出格式
 func formatStack(stack string) string {
-	// 添加分隔线使输出更易读
-	return "======================= FULL STACK TRACE =======================\n" +
+	if stack == "No relevant goroutines found" {
+		return stack
+	}
+
+	return "======================= RELEVANT STACK TRACE =======================\n" +
 		stack +
 		"\n==========================================================="
 }
@@ -74,35 +137,15 @@ func (w *watcher) Stop() error {
 	now := time.Now().Format(time.RFC3339)
 	gid := getCurrentGoroutineID()
 
-	// 获取所有 goroutine 的完整堆栈
-	fullStack := getAllGoroutineStack()
+	// 获取相关 goroutine 的堆栈
+	relevantStacks := getRelevantGoroutineStacks()
 
-	// 获取当前调用链（跳过3层）
-	pc := make([]uintptr, 20)
-	n := runtime.Callers(3, pc)
-	callerTrace := ""
-	if n > 0 {
-		frames := runtime.CallersFrames(pc[:n])
-		var trace strings.Builder
-		for {
-			frame, more := frames.Next()
-			trace.WriteString(fmt.Sprintf("%s\n\t%s:%d\n",
-				frame.Function, frame.File, frame.Line))
-			if !more {
-				break
-			}
-		}
-		callerTrace = trace.String()
-	}
-
-	// 打印所有信息
+	// 打印信息
 	fmt.Printf(`
 [%s] [Goroutine-%d] Watcher stopped
---- Current Caller Trace ---
+--- Relevant Goroutines Stack Trace ---
 %s
---- All Goroutines Stack Trace ---
-%s
-`, now, gid, callerTrace, formatStack(fullStack))
+`, now, gid, formatStack(relevantStacks))
 
 	if w.cancel != nil {
 		w.cancel()
