@@ -20,8 +20,8 @@ type watcher struct {
 	cancel context.CancelFunc
 }
 
-// getRelevantGoroutineStacks 获取当前 goroutine 及相关 goroutine 的堆栈
-func getRelevantGoroutineStacks() string {
+// getAncestorChain 获取当前 goroutine 的祖先链
+func getAncestorChain() string {
 	currentGID := getCurrentGoroutineID()
 
 	// 获取所有 goroutine 的堆栈
@@ -29,8 +29,19 @@ func getRelevantGoroutineStacks() string {
 	n := runtime.Stack(buf, true)
 	allStacks := string(buf[:n])
 
-	// 筛选相关 goroutine
-	var relevantStacks strings.Builder
+	// 构建 goroutine 创建关系图
+	creationGraph := buildCreationGraph(allStacks)
+
+	// 追踪祖先链
+	chain := traceAncestry(currentGID, creationGraph)
+
+	// 提取祖先链的堆栈信息
+	return extractChainStacks(chain, allStacks)
+}
+
+// buildCreationGraph 构建 goroutine 创建关系图
+func buildCreationGraph(allStacks string) map[uint64]uint64 {
+	graph := make(map[uint64]uint64)
 	stacks := strings.Split(allStacks, "\n\n")
 
 	for _, stack := range stacks {
@@ -38,25 +49,126 @@ func getRelevantGoroutineStacks() string {
 			continue
 		}
 
-		// 总是包含当前 goroutine
-		if strings.Contains(stack, fmt.Sprintf("goroutine %d ", currentGID)) {
-			relevantStacks.WriteString(stack)
-			relevantStacks.WriteString("\n\n")
+		// 提取当前 goroutine ID
+		lines := strings.Split(stack, "\n")
+		if len(lines) < 1 {
 			continue
 		}
 
-		// 包含与当前 goroutine 相关的其他 goroutine
-		if isRelatedToCurrent(stack, currentGID) {
-			relevantStacks.WriteString(stack)
-			relevantStacks.WriteString("\n\n")
+		currentID, err := extractGoroutineID(lines[0])
+		if err != nil {
+			continue
+		}
+
+		// 查找创建者
+		for i := len(lines) - 1; i >= 0; i-- {
+			if strings.Contains(lines[i], "created by") {
+				creatorID, err := extractCreatorID(lines[i])
+				if err == nil {
+					graph[currentID] = creatorID
+				}
+				break
+			}
 		}
 	}
 
-	if relevantStacks.Len() == 0 {
-		return "No relevant goroutines found"
+	return graph
+}
+
+// traceAncestry 追踪祖先链
+func traceAncestry(currentGID uint64, graph map[uint64]uint64) []uint64 {
+	chain := []uint64{currentGID}
+
+	for {
+		creator, exists := graph[currentGID]
+		if !exists {
+			break
+		}
+
+		// 避免循环引用
+		if contains(chain, creator) {
+			break
+		}
+
+		chain = append(chain, creator)
+		currentGID = creator
 	}
 
-	return relevantStacks.String()
+	return chain
+}
+
+// extractChainStacks 提取祖先链的堆栈信息
+func extractChainStacks(chain []uint64, allStacks string) string {
+	var builder strings.Builder
+	stacks := strings.Split(allStacks, "\n\n")
+
+	for _, gid := range chain {
+		for _, stack := range stacks {
+			if stack == "" {
+				continue
+			}
+
+			lines := strings.Split(stack, "\n")
+			if len(lines) < 1 {
+				continue
+			}
+
+			id, err := extractGoroutineID(lines[0])
+			if err != nil || id != gid {
+				continue
+			}
+
+			builder.WriteString(stack)
+			builder.WriteString("\n\n")
+			break
+		}
+	}
+
+	if builder.Len() == 0 {
+		return "No ancestor chain found"
+	}
+
+	return builder.String()
+}
+
+// extractGoroutineID 从堆栈行提取 goroutine ID
+func extractGoroutineID(line string) (uint64, error) {
+	if !strings.HasPrefix(line, "goroutine ") {
+		return 0, fmt.Errorf("invalid goroutine line")
+	}
+
+	parts := strings.Split(line, " ")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid goroutine line format")
+	}
+
+	idStr := parts[1]
+	return strconv.ParseUint(idStr, 10, 64)
+}
+
+// extractCreatorID 从创建行提取创建者 ID
+func extractCreatorID(line string) (uint64, error) {
+	if !strings.Contains(line, "in goroutine ") {
+		return 0, fmt.Errorf("no creator info")
+	}
+
+	parts := strings.Split(line, "in goroutine ")
+	if len(parts) < 2 {
+		return 0, fmt.Errorf("invalid creator format")
+	}
+
+	idStr := strings.TrimSpace(parts[1])
+	return strconv.ParseUint(idStr, 10, 64)
+}
+
+// contains 检查切片是否包含元素
+func contains(slice []uint64, item uint64) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 // getCurrentGoroutineID 获取当前 goroutine ID
@@ -69,48 +181,14 @@ func getCurrentGoroutineID() uint64 {
 	return id
 }
 
-// isRelatedToCurrent 判断 goroutine 是否与当前 goroutine 相关
-func isRelatedToCurrent(stack string, currentGID uint64) bool {
-	// 规则1：检查是否由当前 goroutine 创建
-	if strings.Contains(stack, "created by") {
-		if strings.Contains(stack, fmt.Sprintf("in goroutine %d", currentGID)) {
-			return true
-		}
+// formatAncestorChain 格式化祖先链输出
+func formatAncestorChain(chain string) string {
+	if chain == "No ancestor chain found" {
+		return chain
 	}
 
-	// 规则2：检查是否在等待相同的资源（通道、互斥锁等）
-	if strings.Contains(stack, "chan receive") ||
-		strings.Contains(stack, "chan send") ||
-		strings.Contains(stack, "select") ||
-		strings.Contains(stack, "sync.Mutex") {
-		return true
-	}
-
-	// 规则3：检查是否有共同的调用路径（Kratos 相关）
-	commonPrefixes := []string{
-		"github.com/go-kratos/kratos",
-		"contrib/registry/consul",
-		"transport/grpc",
-		"registry.",
-	}
-
-	for _, prefix := range commonPrefixes {
-		if strings.Contains(stack, prefix) {
-			return true
-		}
-	}
-
-	return false
-}
-
-// formatStack 优化堆栈输出格式
-func formatStack(stack string) string {
-	if stack == "No relevant goroutines found" {
-		return stack
-	}
-
-	return "======================= RELEVANT STACK TRACE =======================\n" +
-		stack +
+	return "======================= ANCESTOR CHAIN =======================\n" +
+		chain +
 		"\n==========================================================="
 }
 
@@ -137,15 +215,15 @@ func (w *watcher) Stop() error {
 	now := time.Now().Format(time.RFC3339)
 	gid := getCurrentGoroutineID()
 
-	// 获取相关 goroutine 的堆栈
-	relevantStacks := getRelevantGoroutineStacks()
+	// 获取祖先链
+	ancestorChain := getAncestorChain()
 
 	// 打印信息
 	fmt.Printf(`
 [%s] [Goroutine-%d] Watcher stopped
---- Relevant Goroutines Stack Trace ---
+--- Ancestor Chain Stack Trace ---
 %s
-`, now, gid, formatStack(relevantStacks))
+`, now, gid, formatAncestorChain(ancestorChain))
 
 	if w.cancel != nil {
 		w.cancel()
